@@ -1,352 +1,166 @@
-import { mastra } from "./mastra/index.js";
+import { parseArgs } from "node:util";
+import path from "path";
 import { questions } from "./questions.js";
 import { listModels } from "./models.js";
-import { RequestContext } from "@mastra/core/request-context";
-import fs from "fs";
-import path from "path";
-
-const rawArgs = process.argv.slice(2);
-const force = rawArgs.includes("--force") || rawArgs.includes("--overwrite");
-const positionalArgs = rawArgs.filter((a) => !a.startsWith("--"));
-const [command, workflowKey, jsonInput] = positionalArgs;
+import { resolveQuestions, runBenchmark } from "./bench/orchestrator.js";
+import type { BenchOptions } from "./bench/types.js";
+import { createPlainReporter } from "./ui/plainReporter.js";
+import { renderSummary } from "./ui/summary.js";
 
 function printUsage() {
   console.log(`
-Mastra Workflow CLI
+Preference Benchmark CLI
 
 Usage:
-  npm run cli list                          List available workflows
-  npm run cli run                           Run full preference benchmark
-  npm run cli run preference [questionId]   Run preference benchmark for one question
-  npm run cli run <workflow> [json-input]   Run a workflow with JSON input
+  npm run cli list                      List question ids and models
+  npm run cli run [questionId]          Run the benchmark (all questions, or one)
+
+Flags (flag > env var > default):
+  --force / --overwrite     Re-run pairs that already have results
+  --models <a,b,...>        Only models whose name contains one of these substrings
+  --concurrency <n>         Global in-flight LLM request limit (LLM_CONCURRENCY, default 10)
+  --pairs <n>               Model×question pairs run concurrently (BENCH_PAIRS, default 4)
+  --max-runs <n>            Runs per pair (MAX_RUNS, default 10)
+  --threshold <n>           Early-stop once one answer reaches n (CONSENSUS_THRESHOLD;
+                            default off — every pair runs the full --max-runs)
+  --batch-size <n>          Runs per batch (BATCH_SIZE, default = threshold if set, else 5)
+  --no-ui                   Plain log output instead of the interactive UI
+
+Env only: LLM_TIMEOUT_MS (60000), LLM_MAX_RETRIES (3), LLM_MAX_OUTPUT_TOKENS (provider default),
+          LOG_REASONING (plain output only)
 
 Examples:
-  npm run cli list
   npm run cli run
-  npm run cli run preference cat-or-dog
-  npm run cli run exampleWorkflow '{"text": "hello world"}'
-
-Flags:
-  --force / --overwrite   Re-run even if results already exist for a model×question pair
-
-Examples with --force:
-  npm run cli run --force
-  npm run cli run preference cat-or-dog --force
+  npm run cli -- run cat-or-dog --force
+  npm run cli -- run --concurrency 20 --pairs 8
 `);
 }
 
-async function listWorkflows() {
-  const workflows = mastra.listWorkflows();
-  const keys = Object.keys(workflows);
-  if (keys.length === 0) {
-    console.log("No workflows registered.");
-    return;
+function listQuestionsAndModels() {
+  console.log("Questions:");
+  for (const q of questions) {
+    console.log(`  ${q.id}${q.hidden ? " (hidden)" : ""}`);
   }
-  console.log("Available workflows:");
-  for (const key of keys) {
-    console.log(`  ${key}`);
-  }
-}
-
-async function runWorkflow(key: string, input: string | undefined) {
-  let inputData: Record<string, unknown> = {};
-
-  if (input) {
-    try {
-      inputData = JSON.parse(input);
-    } catch {
-      console.error(`Error: invalid JSON input: ${input}`);
-      process.exit(1);
-    }
-  }
-
-  const workflow = mastra.getWorkflow(key as any);
-  const run = await workflow.createRun();
-
-  console.log(`Running workflow "${key}"...`);
-
-  const requestContext = new RequestContext();
-  for (const [k, v] of Object.entries(inputData)) {
-    requestContext.set(k, v);
-  }
-
-  const result = await run.start({ inputData: inputData as any, requestContext });
-
-  if (result.status === "success") {
-    console.log("\nResult:");
-    console.log(JSON.stringify(result.result, null, 2));
-  } else if (result.status === "failed") {
-    console.error("\nWorkflow failed:");
-    console.error(result.error);
-    process.exit(1);
-  } else {
-    console.log(`\nWorkflow ended with status: ${result.status}`);
-    console.log(JSON.stringify(result, null, 2));
+  console.log("\nModels:");
+  for (const m of listModels()) {
+    const meta = [m.released, m.hidden ? "hidden" : ""].filter(Boolean).join(", ");
+    console.log(`  ${m.name}${meta ? `  (${meta})` : ""}`);
   }
 }
 
-type Answer = { value: string; count: number; percent: number };
-
-type RawRun = {
-  prompt: string;
-  rawResponse: string;
-  normalizedAnswer: string;
-};
-
-type ModelResult = {
-  model: string;
-  company: string;
-  runs: number;
-  answers: Answer[];
-  raw: RawRun[];
-};
-
-type QuestionFile = {
-  id: string;
-  prompts: string[];
-  displayQuestion?: string;
-  note?: string;
-  results: ModelResult[];
-};
-
-function readQuestionFile(filePath: string): QuestionFile | null {
-  if (!fs.existsSync(filePath)) return null;
-  return JSON.parse(fs.readFileSync(filePath, "utf-8")) as QuestionFile;
-}
-
-function writeQuestionFile(filePath: string, data: QuestionFile) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
-
-function formatCost(cost: number): string {
-  if (cost === 0) return "$0.00";
-  if (cost < 0.01) return `$${cost.toFixed(6)}`;
-  return `$${cost.toFixed(4)}`;
-}
-
-function aggregateAnswers(allAnswers: string[]): Answer[] {
-  const total = allAnswers.length;
-  const counts = new Map<string, number>();
-  for (const val of allAnswers) {
-    counts.set(val, (counts.get(val) ?? 0) + 1);
-  }
-  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const answers = entries.map(([value, count]) => ({
-    value,
-    count,
-    percent: Math.round((count / total) * 1000) / 10,
-  }));
-  const sum = answers.reduce((acc, a) => acc + a.percent, 0);
-  const diff = Math.round((100 - sum) * 10) / 10;
-  if (answers.length > 0 && diff !== 0) {
-    answers[0].percent = Math.round((answers[0].percent + diff) * 10) / 10;
-  }
-  return answers;
-}
-
-async function runWorkflowBatch(
-  workflow: any,
-  prompts: string[],
-  normalizationPrompt: string,
-  modelName: string
-): Promise<{ runs: RawRun[]; preferenceCost: number; normalizationCost: number } | null> {
-  const requestContext = new RequestContext();
-  requestContext.set("modelName", modelName);
-
-  const run = await workflow.createRun();
-  const result = await run.start({
-    inputData: { prompts, normalizationPrompt } as any,
-    requestContext,
-  });
-
-  if (result.status !== "success") {
-    console.error(`  Failed: ${(result as any).error}`);
-    return null;
-  }
-
-  return result.result as { runs: RawRun[]; preferenceCost: number; normalizationCost: number };
-}
-
-async function runBenchmark(questionId?: string, force = false) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    console.error("Error: OPENROUTER_API_KEY environment variable is required.");
+function intOption(flagValue: string | undefined, envName: string, fallback: number): number {
+  const raw = flagValue ?? process.env[envName];
+  if (raw === undefined || raw === "") return fallback;
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n) || n <= 0) {
+    console.error(`Error: invalid value "${raw}" for ${envName}`);
     process.exit(1);
   }
-
-  const consensusThreshold = parseInt(process.env.CONSENSUS_THRESHOLD ?? "5", 10);
-  const batchSize = parseInt(process.env.BATCH_SIZE ?? String(consensusThreshold), 10);
-  const maxRuns = parseInt(process.env.MAX_RUNS ?? "20", 10);
-
-  const models = listModels();
-  const resultsDir = path.join(process.cwd(), "results");
-
-  const workflow = mastra.getWorkflow("preference" as any);
-
-  let filteredQuestions = questions;
-  if (questionId) {
-    filteredQuestions = questions.filter((q) => q.id === questionId);
-    if (filteredQuestions.length === 0) {
-      console.error(`Error: unknown question id "${questionId}". Available ids:`);
-      for (const q of questions) console.error(`  ${q.id}`);
-      process.exit(1);
-    }
-  }
-
-  const totalInvocations = filteredQuestions.length * models.length;
-  let current = 0;
-  let grandTotalCost = 0;
-
-  for (const q of filteredQuestions) {
-    for (const model of models) {
-      current++;
-      const shortModel = model.name.split("/").pop() ?? model.name;
-      const filePath = path.join(resultsDir, `${q.id}.json`);
-
-      if (!force) {
-        const existing = readQuestionFile(filePath);
-        if (existing?.results.some((r) => r.model === model.name)) {
-          console.log(`Skipping "${q.id}" × ${shortModel} — already have results (use --force to overwrite)`);
-          continue;
-        }
-      }
-
-      console.log(`Running "${q.id}" × ${shortModel} (${current}/${totalInvocations})...`);
-
-      const allAnswers: string[] = [];
-      const allRawRuns: RawRun[] = [];
-      let totalRuns = 0;
-      let totalPrefCost = 0;
-      let totalNormCost = 0;
-      let batchNum = 0;
-
-      while (true) {
-        const remaining = maxRuns - totalRuns;
-        if (remaining <= 0) break;
-        const thisBatch = Math.min(batchSize, remaining);
-        batchNum++;
-
-        // Cycle through prompt variants for this batch
-        const batchPrompts = Array.from({ length: thisBatch }, (_, i) =>
-          q.prompts[(totalRuns + i) % q.prompts.length]
-        );
-
-        console.log(`  batch ${batchNum} (${thisBatch} runs)...`);
-        const batchResult = await runWorkflowBatch(workflow, batchPrompts, q.normalizationPrompt, model.name);
-        if (!batchResult) break;
-
-        allAnswers.push(...batchResult.runs.map((r) => r.normalizedAnswer));
-        allRawRuns.push(...batchResult.runs);
-        totalRuns += thisBatch;
-        totalPrefCost += batchResult.preferenceCost;
-        totalNormCost += batchResult.normalizationCost;
-
-        // Check consensus
-        const counts = new Map<string, number>();
-        for (const a of allAnswers) counts.set(a, (counts.get(a) ?? 0) + 1);
-        const maxCount = Math.max(...counts.values());
-        if (maxCount >= consensusThreshold) {
-          const topAnswer = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
-          console.log(`  consensus after ${totalRuns} runs: ${topAnswer[0]} (${topAnswer[1]}x)`);
-          break;
-        }
-      }
-
-      if (allAnswers.length === 0) continue;
-
-      const totalCost = totalPrefCost + totalNormCost;
-      grandTotalCost += totalCost;
-      console.log(
-        `  cost: preference ${formatCost(totalPrefCost)}, normalization ${formatCost(totalNormCost)}, total ${formatCost(totalCost)}`
-      );
-
-      const answers = aggregateAnswers(allAnswers);
-
-      // Merge into results file
-      const existing = readQuestionFile(filePath);
-
-      const modelResultEntry: ModelResult = {
-        model: model.name,
-        company: model.company,
-        runs: totalRuns,
-        answers,
-        raw: allRawRuns,
-      };
-
-      let fileData: QuestionFile;
-      if (existing) {
-        fileData = existing;
-        fileData.prompts = q.prompts;
-        fileData.displayQuestion = q.displayQuestion;
-        fileData.note = q.note;
-        const idx = fileData.results.findIndex((r) => r.model === model.name);
-        if (idx >= 0) {
-          fileData.results[idx] = modelResultEntry;
-        } else {
-          fileData.results.push(modelResultEntry);
-        }
-      } else {
-        fileData = {
-          id: q.id,
-          prompts: q.prompts,
-          displayQuestion: q.displayQuestion,
-          note: q.note,
-          results: [modelResultEntry],
-        };
-      }
-
-      writeQuestionFile(filePath, fileData);
-      console.log(`  → ${answers.map((a) => `${a.value}: ${a.percent}%`).join(", ")}`);
-    }
-  }
-
-  // Summary table
-  console.log("\n--- Summary ---");
-  console.log(`Total cost: ${formatCost(grandTotalCost)}`);
-  for (const q of filteredQuestions) {
-    const filePath = path.join(resultsDir, `${q.id}.json`);
-    const data = readQuestionFile(filePath);
-    if (!data) continue;
-    console.log(`\n${q.id}:`);
-    for (const r of data.results) {
-      const short = r.model.split("/").pop() ?? r.model;
-      const summary = r.answers.map((a) => `${a.value}: ${a.percent}%`).join(", ");
-      console.log(`  ${short} (${r.runs} runs): ${summary}`);
-    }
-  }
+  return n;
 }
 
 async function main() {
-  if (!command || command === "help" || command === "--help") {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(2),
+    allowPositionals: true,
+    options: {
+      force: { type: "boolean", default: false },
+      overwrite: { type: "boolean", default: false },
+      concurrency: { type: "string" },
+      models: { type: "string" },
+      pairs: { type: "string" },
+      "max-runs": { type: "string" },
+      "batch-size": { type: "string" },
+      threshold: { type: "string" },
+      "no-ui": { type: "boolean", default: false },
+      help: { type: "boolean", default: false },
+    },
+  });
+
+  const [command, ...rest] = positionals;
+
+  if (!command || command === "help" || values.help) {
     printUsage();
     return;
   }
 
   if (command === "list") {
-    await listWorkflows();
+    listQuestionsAndModels();
     return;
   }
 
-  if (command === "run" && !workflowKey) {
-    await runBenchmark(undefined, force);
-    return;
+  if (command !== "run") {
+    console.error(`Unknown command: ${command}\n`);
+    printUsage();
+    process.exit(1);
   }
 
-  if (command === "run" && workflowKey === "preference") {
-    // jsonInput is the questionId (positional arg, not JSON)
-    await runBenchmark(jsonInput, force);
-    return;
+  if (!process.env.OPENROUTER_API_KEY) {
+    console.error("Error: OPENROUTER_API_KEY environment variable is required.");
+    process.exit(1);
   }
 
-  if (command === "run") {
-    await runWorkflow(workflowKey, jsonInput);
-    return;
+  // Back-compat: "run preference <id>" was the old form
+  const questionId = rest[0] === "preference" ? rest[1] : rest[0];
+
+  // Fixed run count by default; consensus early-stop only when a threshold is given.
+  const thresholdSet = values.threshold !== undefined || !!process.env.CONSENSUS_THRESHOLD;
+  const threshold = thresholdSet ? intOption(values.threshold, "CONSENSUS_THRESHOLD", 0) : undefined;
+  const resultsDir = path.join(process.cwd(), "results");
+  const controller = new AbortController();
+
+  const options: BenchOptions = {
+    questionId,
+    models: values.models?.split(",").map((m) => m.trim()).filter(Boolean),
+    force: values.force || values.overwrite,
+    concurrency: intOption(values.concurrency, "LLM_CONCURRENCY", 10),
+    pairs: intOption(values.pairs, "BENCH_PAIRS", 4),
+    maxRuns: intOption(values["max-runs"], "MAX_RUNS", 10),
+    batchSize: intOption(values["batch-size"], "BATCH_SIZE", threshold ?? 5),
+    threshold,
+    timeoutMs: intOption(undefined, "LLM_TIMEOUT_MS", 60_000),
+    maxRetries: intOption(undefined, "LLM_MAX_RETRIES", 3),
+    maxOutputTokens: process.env.LLM_MAX_OUTPUT_TOKENS
+      ? intOption(undefined, "LLM_MAX_OUTPUT_TOKENS", 0)
+      : undefined,
+    resultsDir,
+    runLogPath: path.join(resultsDir, "runs.jsonl"),
+    signal: controller.signal,
+  };
+
+  let filteredQuestions;
+  try {
+    filteredQuestions = resolveQuestions(questionId);
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
   }
 
-  console.error(`Unknown command: ${command}\n`);
-  printUsage();
-  process.exit(1);
+  // First Ctrl-C drains gracefully (no new batches, in-flight requests aborted,
+  // finished pairs stay on disk); second Ctrl-C force-quits.
+  let interrupts = 0;
+  const onInterrupt = () => {
+    interrupts++;
+    if (interrupts >= 2) process.exit(130);
+    controller.abort();
+  };
+  process.on("SIGINT", onInterrupt);
+
+  const useInk = process.stdout.isTTY && !values["no-ui"];
+  let summary;
+  if (useInk) {
+    const { startInkUi } = await import("./ui/App.js");
+    const ui = startInkUi({ onInterrupt, maxRuns: options.maxRuns });
+    try {
+      summary = await runBenchmark(options, ui.emit);
+    } finally {
+      await ui.finish();
+    }
+  } else {
+    summary = await runBenchmark(options, createPlainReporter());
+  }
+
+  console.log(renderSummary(filteredQuestions, resultsDir, summary));
 }
 
 main().catch((err) => {

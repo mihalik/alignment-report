@@ -1,42 +1,25 @@
 ---
 import Base from '../layouts/Base.astro';
-import { readFileSync, readdirSync } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { marked } from 'marked';
 import { computeStats } from '../lib/stats';
-
-interface QuestionResult {
-  id: string;
-  prompts: string[];
-  displayQuestion?: string;
-  note?: string;
-  results: Array<{
-    model: string;
-    company?: string;
-    runs: number;
-    answers: Array<{ value: string; count: number; percent: number }>;
-  }>;
-}
+import { loadQuestions, type QuestionPage } from '../lib/questions';
 
 export async function getStaticPaths() {
-  const resultsDir = join(dirname(fileURLToPath(import.meta.url)), '../../../results');
-  const results: QuestionResult[] = readdirSync(resultsDir)
-    .filter((f) => f.endsWith('.json'))
-    .map((f) => JSON.parse(readFileSync(join(resultsDir, f), 'utf8')));
-  return results.map((data) => ({
+  return loadQuestions().map((data) => ({
     params: { id: data.id },
     props: { data },
   }));
 }
 
-const { data } = Astro.props as { data: QuestionResult };
+const { data } = Astro.props as { data: QuestionPage };
 
 const renderedNote = data.note ? await marked(data.note) : null;
 
+const visibleResults = data.results;
+
 // Group results by company
-const groupMap = new Map<string, typeof data.results>();
-for (const r of data.results) {
+const groupMap = new Map<string, typeof visibleResults>();
+for (const r of visibleResults) {
   const company = r.company ?? 'Other';
   if (!groupMap.has(company)) groupMap.set(company, []);
   groupMap.get(company)!.push(r);
@@ -75,7 +58,7 @@ for (const value of allValues) {
   }
 }
 
-const stats = computeStats(data.results);
+const stats = computeStats(visibleResults);
 
 const MUTED = ['hedge', 'refusal', 'other'];
 const realAnswers = stats?.macroAnswers.filter((a) => !MUTED.includes(a.value)) ?? [];
